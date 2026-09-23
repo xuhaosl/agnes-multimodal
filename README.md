@@ -18,9 +18,10 @@
 
 ## 快速开始
 
-本仓库的根目录**就是这个 skill 本体**。把整个文件夹拷进 Hermes 的 skill 目录即可：
+本仓库的根目录**就是这个 skill 本体**。先克隆到本地，再拷进 Hermes 的 skill 目录：
 
 ```bash
+git clone https://github.com/xuhaosl/agnes-multimodal.git
 cp -r agnes-multimodal ~/.hermes/skills/
 ```
 

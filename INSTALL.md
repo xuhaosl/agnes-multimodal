@@ -10,10 +10,12 @@
 
 ## 一、安装
 
-Hermes 的 skill 主目录是 `~/.hermes/skills/`，把本 skill 的整个文件夹拷进去即可
+先把它克隆到本地（不习惯命令行的话，GitHub 页面上的 **Code** 按钮里可以直接下载 ZIP
+解压，效果一样），再把整个文件夹拷进 Hermes 的 skill 主目录 `~/.hermes/skills/`
 （分类层是**可选**的，想归类也可以放到 `~/.hermes/skills/media/agnes-multimodal/`）：
 
 ```bash
+git clone https://github.com/xuhaosl/agnes-multimodal.git
 cp -r agnes-multimodal ~/.hermes/skills/
 ```
 
@@ -143,7 +145,8 @@ python ~/.hermes/skills/agnes-multimodal/scripts/agnes_video.py \
 ## 七、升级
 
 直接覆盖脚本与 SKILL.md 即可，`~/.agnes/invocations.log` 和 `~/.hermes/.env`
-不受影响：
+不受影响。当初用 `git clone` 拿的，先在仓库目录里 `git pull` 取到最新版；
+当初下 ZIP 的，重新下载解压即可：
 
 ```bash
 cp -r agnes-multimodal ~/.hermes/skills/

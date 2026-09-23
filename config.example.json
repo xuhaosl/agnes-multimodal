@@ -1,0 +1,21 @@
+{
+  "_说明": "复制到 ~/.agnes/config.json 后按需修改。命令行参数优先级高于本文件；环境变量优先级介于两者之间。",
+  "api_key": "sk-在这里填你的 Agnes API Key",
+  "base_url": "https://api.agnes-ai.cn/v1",
+  "out_dir": "~/agnes-output",
+  "timeout": 300,
+  "image": {
+    "model": "agnes-image-2.5-flash",
+    "size": "2K",
+    "ratio": "1:1",
+    "response_format": "url"
+  },
+  "video": {
+    "model": "agnes-video-2.5-flash",
+    "seconds": "5",
+    "size": "720P",
+    "aspect_ratio": "16:9",
+    "poll_interval": 5,
+    "max_wait": 900
+  }
+}

@@ -1,0 +1,51 @@
+name: Bug 报告
+description: 脚本报错、装不上、守卫误拦等问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        填好下面三项，能省掉一轮来回。
+
+        > 贴输出之前，请先把 API Key 删掉。
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Hermes 后端
+      description: 你是在哪个环境里跑这个 skill 的？
+      options:
+        - local（本机）
+        - Docker
+        - Modal
+        - 不确定
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: 复现命令
+      description: 完整贴出你执行的命令
+      render: shell
+      placeholder: 'python ~/.hermes/skills/agnes-multimodal/scripts/agnes_image.py "一只章鱼" --size 1K'
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: 实际输出
+      description: 完整输出，包含退出码
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统与 Python 版本
+      placeholder: "Windows 11 / Python 3.11.5"
+    validations:
+      required: false

@@ -68,6 +68,13 @@ FLASH_MAX_IMAGES = 5
 FLASH_MAX_AUDIOS = 3
 FLASH_SIZE = "720P"
 
+# 创建任务的重试策略：实测 503（视频队列已满）与 429 会连着来，
+# http_json 默认的 2s/4s 退避远远不够（见 SKILL.md Pitfalls：要等到 45s 量级才建得起来）。
+# 旧版把这件事写在文档里、让调用方自己退避，属于「文档提醒了但代码没做」——
+# 现在内置：45s / 90s / 180s。调用方只需要保证串行。
+CREATE_RETRIES = 3
+CREATE_BACKOFF = 45.0
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -242,7 +249,8 @@ def main() -> int:
         # 请求前先确认目标确实在 Agnes 上（非 Agnes 域名/模型名直接拒绝）
         guard_target(create_url, model)
 
-        created = http_json("POST", create_url, api_key, payload=payload, timeout=timeout)
+        created = http_json("POST", create_url, api_key, payload=payload, timeout=timeout,
+                            retries=CREATE_RETRIES, backoff=CREATE_BACKOFF)
         if args.json:
             print(json.dumps(created, ensure_ascii=False, indent=2))
 

@@ -62,9 +62,18 @@ def entry(name="Agnes", section_key="custom_providers", dash=True,
 results = []
 
 
+# 同 test_hermes_key.py：本机真实凭据与 Hermes 的 provider 变量族一律不进子进程，
+# 否则「不该命中」的用例会被宿主导出的 key_env 变量喂出假结果。
+SCRUB_KEYS = ("AGNES_API_KEY", "AGNES_AI_API_KEY", "AGNES_CONFIG_PATH", "HERMES_HOME")
+
+
+def _clean_env():
+    return {k: v for k, v in os.environ.items()
+            if k not in SCRUB_KEYS and not k.startswith("HERMES_CUSTOM_API")}
+
+
 def run(env=None):
-    base = {k: v for k, v in os.environ.items()
-            if k not in ("AGNES_API_KEY", "AGNES_AI_API_KEY", "AGNES_CONFIG_PATH", "HERMES_HOME")}
+    base = _clean_env()
     if env:
         base.update(env)
     p = subprocess.run([PY, str(COMMON), "--check-key"], capture_output=True, text=True,

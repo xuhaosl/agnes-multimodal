@@ -169,11 +169,56 @@ def _key_from_workbuddy_models() -> str:
 # --------------------------------------------------------------------------
 
 HERMES_HOME_ENV = "HERMES_HOME"
+
+# Hermes 官方 Docker Compose 把数据目录挂到 /opt/data。这里只声明「候选位置」，
+# 是否真的采用它由 _docker_data_dir() 判定 —— 不能无条件认，否则测试隔离、
+# 多 profile、非官方部署形态都会被它串到真实配置上（详见该函数 docstring）。
+# 注意：DOCKER_CONFIG_PATH（= 本 skill 自己的配置，也在挂载卷里）是另一个语义，
+# 不由此常量派生 —— 它必须与 _config_candidates() 的读候选保持同一字面量。
+DOCKER_DATA_DIR = "/opt/data"
+
 ENV_KEY_NAME_HINT = ("AGNES_API_KEY", "AGNES_AI_API_KEY")
 # 归属证据：不写死 section 名（Hermes 升级可能改叫 providers / custom_providers / 别的），
 # 改看内容像不像 Agnes，这样名字变了也还能命中。
 AGNES_HOST_HINT = "agnes-ai.cn"
 AGNES_MODEL_HINT = re.compile(r"agnes-(?:image|video|\d)", re.I)
+
+
+def _looks_like_hermes_home(path: Path) -> bool:
+    """目录里确实有 Hermes 自己的配置文件，才算「像个 Hermes home」。"""
+    try:
+        return any((path / name).is_file() for name in ("config.yaml", "config.yml", ".env"))
+    except Exception:
+        return False
+
+
+def _os_is_posix() -> bool:
+    """平台探测单独成一个函数，**只为让测试能注入**。
+
+    测试不能直接改 os.name —— 那会让 pathlib 改为实例化 PosixPath，
+    在 Windows 上直接抛 NotImplementedError，根本测不出结果。
+    """
+    return os.name != "nt"
+
+
+def _docker_data_dir() -> Path | None:
+    """Docker 兜底数据目录：只有「当前这套 Hermes 的数据目录就是 /opt/data」时才返回它。
+
+    显式给了 HERMES_HOME 且指向别处（测试隔离、多 profile、其它部署形态）时返回 None ——
+    否则「只认自己家目录」的判定会串到 /opt/data 上，把不属于本 home 的配置读进来、写出去。
+    这个穿透会同时污染读侧（_hermes_homes → 取 Key）与写侧（writable_config_path → 写 Key）。
+    """
+    if not _os_is_posix():
+        return None
+    path = Path(DOCKER_DATA_DIR)
+    raw = os.environ.get(HERMES_HOME_ENV, "").strip()
+    if raw:
+        try:
+            same = Path(raw).expanduser().resolve(strict=False) == path.resolve(strict=False)
+        except Exception:
+            return None
+        return path if same else None
+    return path if _looks_like_hermes_home(path) else None
 
 
 def _hermes_homes() -> list:
@@ -182,8 +227,9 @@ def _hermes_homes() -> list:
     if raw:
         out.append(Path(raw).expanduser())
     out.append(Path.home() / ".hermes")
-    if os.name != "nt":
-        out.append(Path("/opt/data"))
+    docker_home = _docker_data_dir()
+    if docker_home is not None:
+        out.append(docker_home)
     seen, uniq = set(), []
     for item in out:
         token = str(item)
@@ -513,6 +559,9 @@ def writable_config_path(explicit: str | None = None) -> Path:
       4. 默认位置：Hermes Docker 容器里写挂载卷 /opt/data/agnes/config.json
          （容器内 ~ 不是持久化卷，写到那儿一重建就丢）；其余情况写 ~/.agnes/config.json
 
+    第 4 条走不走，由 _docker_data_dir() 判定 —— 必须是「本套 Hermes 的数据目录就是
+    /opt/data」，而不是「/opt/data 存在」。
+
     注意：返回的路径必须也在 _config_candidates() 里，否则会「写进去了却读不回来」。
     另外，无论走哪条分支，目标都不能是 Hermes 自己的文件（见 assert_write_allowed）。
     """
@@ -522,7 +571,10 @@ def writable_config_path(explicit: str | None = None) -> Path:
     for path in _config_candidates():
         if path.exists():
             return assert_write_allowed(path)
-    if os.name != "nt" and os.path.isdir("/opt/data") and os.access("/opt/data", os.W_OK):
+    # 写入路径仍取 DOCKER_CONFIG_PATH 字面量，而不是 docker_home / "agnes" / ... ——
+    # 必须与 _config_candidates() 的读候选逐字一致，否则「写进去却读不回来」。
+    docker_home = _docker_data_dir()
+    if docker_home is not None and os.access(str(docker_home), os.W_OK):
         return assert_write_allowed(Path(DOCKER_CONFIG_PATH))
     return assert_write_allowed(Path.home() / ".agnes" / "config.json")
 

@@ -107,6 +107,9 @@ skill 的目录层级必须是：
 `<分类>` 那层可有可无 —— ✅ **实测依据**：Hermes 官方原文「The category folder is
 optional too — a skill can sit directly under `~/.hermes/skills/`」。
 
+> **本文其余命令统一按 `media/` 这一层书写**（与 frontmatter 里的 `category: media` 对应）。
+> 若你选择直接放在 `skills/` 下，把命令里的 `media/` 去掉即可 —— 两个位置都能被扫到。
+
 **原生安装**直接放 `~/.hermes/skills/`：
 
 ```bash
@@ -118,7 +121,8 @@ cp -r agnes-multimodal ~/.hermes/skills/media/
 效果等同于放进容器。若你习惯在服务器上直接操作，也可以 `git clone` 到该目录：
 
 ```bash
-cd <宿主机数据目录>/skills        # 例如 ~/.hermes/skills
+mkdir -p <宿主机数据目录>/skills/media    # 例如 ~/.hermes/skills/media
+cd <宿主机数据目录>/skills/media
 git clone https://github.com/xuhaosl/agnes-multimodal.git
 ```
 
@@ -129,13 +133,13 @@ https://github.com/xuhaosl/agnes-multimodal/archive/refs/heads/main.zip
 ```
 
 解压后目录名是 `agnes-multimodal-main`，**改成 `agnes-multimodal`**，再用你惯用的方式
-（scp / SMB / 网盘 / 面板文件管理）传到宿主机的 `<数据目录>/skills/` 下。
+（scp / SMB / 网盘 / 面板文件管理）传到宿主机的 `<数据目录>/skills/media/` 下。
 `.hermes` 若是隐藏目录，先打开「显示隐藏文件」。
 
 **Docker 情形再确认一遍容器里也看得到：**
 
 ```bash
-docker exec <容器名> ls /opt/data/skills/agnes-multimodal/
+docker exec <容器名> ls /opt/data/skills/media/agnes-multimodal/
 ```
 
 能看到 `SKILL.md` `scripts` 就对了。
@@ -160,7 +164,7 @@ Docker 部署下要先进容器：`docker exec -it <容器名> hermes chat -s ag
 
 - 目录层级是否为 `<数据目录>/skills/[<分类>/]agnes-multimodal/SKILL.md`
 - frontmatter 是否完整（`name` 与 `description` 是仅有的两个必填项）
-- Docker 情形：`docker exec <容器名> ls /opt/data/skills/agnes-multimodal/` 是否看得到
+- Docker 情形：`docker exec <容器名> ls /opt/data/skills/media/agnes-multimodal/` 是否看得到
 
 ### 2.4 Hermes 上的密钥
 
@@ -234,17 +238,27 @@ python scripts/agnes_common.py --set-key sk-xxxx       # 写入（agent 用这�
 `/opt/data/agnes/config.json`，是挂载卷里的**自有子目录**，和 Hermes 的文件互不干扰）。
 要改 Hermes 自己的配置，请用 `hermes setup` 或手动编辑。
 
-**如果想让 Key 完全不经过对话**（值不进模型上下文），可以改用 Hermes 自带的引导机制：
-本 skill 的 frontmatter 声明了 `required_environment_variables: AGNES_API_KEY`，
-首次 `skill_view` 加载时会弹安全提示让你填，值存进 `~/.hermes/.env`，不暴露给模型。
+**Key 也可以完全不经过对话**（值不进模型上下文）：写进 `~/.hermes/.env` 就行 ——
+脚本自己会解析这个**文件**，不依赖任何对话交互。
 
-这一步**不能省，原因很硬**：Hermes 的子进程默认跑在最小环境里，官方原文写着 ——
-变量名里含 `KEY`、`TOKEN`、`SECRET`、`PASSWORD`、`CREDENTIAL`、`PASSWD`、`AUTH`
-的环境变量**一律被剥离**，只放行 `PATH`、`HOME`、`LANG` 这类安全系统变量。
-`AGNES_API_KEY` 名字里带 `KEY`，**skill 不声明就会被 Hermes 挡在门外**。
-声明之后，Hermes 才会把它透传进 `terminal` 和 `execute_code` 子进程。
+> ⚠️ **一个已修正的坑**：本 skill 的 frontmatter 里 `AGNES_API_KEY` 标的是
+> **`optional: true`**，所以加载技能时**不会**弹密钥录入提示。这是有意为之 ——
+> 见下面「为什么标成可选」。**别去改成必需**。
 
-也可以直接手写这个文件（Key 不进模型上下文，也不依赖交互提示）：
+**为什么标成可选（原因很硬）**：Hermes 的子进程默认跑在最小环境里，变量名里含 `KEY`、
+`TOKEN`、`SECRET`、`PASSWORD`、`CREDENTIAL`、`PASSWD`、`AUTH` 的环境变量**一律被剥离**，
+只放行 `PATH`、`HOME`、`LANG` 这类安全系统变量。
+
+所以**别指望靠 `export AGNES_API_KEY=...`** 或者指望 Hermes 帮你透传变量 —— 那条路要额外
+在 `config.yaml` 里声明 `terminal.env_passthrough`。
+
+本 skill 走的是**读文件**这条路：脚本自己解析 `$HERMES_HOME/.env`（以及 `config.yaml` 里
+provider 块的 `key_env`），**与变量透传无关** —— 文件放对了就一定读得到，比透传省事得多。
+
+反过来，把它标成**必需**的副作用很实在：Hermes 会认为「这技能缺密钥」并弹出录入提示，
+谁填了，`~/.hermes/.env` 里就会多出一份和 provider 重复的副本（真机上发生过，属于纯冗余）。
+
+手写这个文件即可（Key 不进模型上下文，也不依赖交互提示）：
 
 ```bash
 mkdir -p ~/.hermes
@@ -273,12 +287,21 @@ docker exec <容器名> sh -c "grep -o 'AGNES_API_KEY=sk-.\{0,6\}' /opt/data/.en
 若你的 compose 没把整个数据目录挂上去，`.env` 可能不在 `/opt/data/.env`，
 用 2.1 的 `docker inspect` 输出对照一下就知道。
 
-如果脚本跑在远程后端（Docker / Modal），确认这个变量在 `config.yaml` 的
-`terminal.env_passthrough` 名单里 —— **但本 skill 已声明，正常不需要这条**，
-只有在你删改了 frontmatter 时才用得上。
+写进 `.env` **文件**就够了 —— 脚本自己解析它，不依赖变量透传。
+只有当你确实想用「环境变量」而不是文件时，才需要在 `config.yaml` 里把变量加进
+`terminal.env_passthrough` 名单（见上方「为什么标成可选」）。
 
-**注意优先级**：环境变量 > 配置文件。若 `AGNES_API_KEY` 已存在于环境中，
-`--set-key` 写入的配置**不会生效**，脚本会明确告警，此时要改的是环境变量。
+**注意优先级**（`resolve_api_key()` 的实际顺序，命中即停）：
+
+`--api-key` → **进程环境变量** → 配置文件（`~/.agnes/config.json` 等）→
+Hermes 的 `config.yaml` / `.env` → WorkBuddy 的 `models.json`
+
+也就是说 **进程环境变量会盖过配置文件**：若 `AGNES_API_KEY` 已在环境里，
+`--set-key` 写进去的配置不会生效，脚本会明确告警 —— 此时要改的是环境变量。
+
+> 别和另一件事混淆：同一个 `key_env` 变量在 `.env` **文件**与进程环境里都有值时，
+> `pick()` 取文件那份。那是「同一个变量的两个来源」的先后，与上面整体来源的
+> 优先级是两码事。
 
 ### 2.5 Docker Compose 专属：三处「会丢」的地方
 
@@ -322,7 +345,7 @@ AGNES_LOG_FILE=/opt/data/.agnes/invocations.log
 `.gitignore` 已排除它，不会被误提交）：
 
 ```bash
-cd <数据目录>/skills/agnes-multimodal
+cd <数据目录>/skills/media/agnes-multimodal
 cp config.example.json config.json
 vi config.json        # 填 api_key
 chmod 600 config.json
@@ -333,7 +356,7 @@ chmod 600 config.json
 | 内容 | 安全位置 |
 | --- | --- |
 | API Key | `~/.hermes/.env`（容器内 `/opt/data/.env`） |
-| 配置文件（若用上面的方式） | `<数据目录>/skills/agnes-multimodal/config.json` |
+| 配置文件（若用上面的方式） | `<数据目录>/skills/media/agnes-multimodal/config.json` |
 | 产物与日志（若按本节配了） | `<数据目录>/agnes-output/`、`<数据目录>/.agnes/` |
 
 判断原则就一条：**凡是你希望留下来的东西，都得在 `/opt/data` 底下**
@@ -412,10 +435,10 @@ python <SKILL_DIR>/scripts/agnes_video.py "一只戴墨镜的章鱼在海底缓�
 - WorkBuddy：`~/.workbuddy/skills/agnes-multimodal`
 - Hermes 原生：`~/.hermes/skills/media/agnes-multimodal`
 - Hermes 里也可以直接用内置变量：`${HERMES_SKILL_DIR}/scripts/agnes_image.py`
-- **Docker 部署**：在容器内跑，路径是 `/opt/data/skills/agnes-multimodal`
+- **Docker 部署**：在容器内跑，路径是 `/opt/data/skills/media/agnes-multimodal`
 
 ```bash
-docker exec <容器名> python3 /opt/data/skills/agnes-multimodal/scripts/agnes_common.py
+docker exec <容器名> python3 /opt/data/skills/media/agnes-multimodal/scripts/agnes_common.py
 ```
 
 自检的期望输出：
@@ -490,18 +513,18 @@ ls -lh <数据目录>/agnes-output/
 
 | 现象 | 原因与处理 |
 | --- | --- |
-| 自检报「**密钥来源: 未找到**」 | ① `.env` 里有没有 `AGNES_API_KEY=`（用 `grep -c` 确认只有 1 条）；② **skill 的 frontmatter 有没有 `required_environment_variables`** —— 没有的话 Hermes 会把带 `KEY` 的变量剥离掉；③ Docker 情形确认 `.env` 在容器内的正确路径（用 2.1 的 `docker inspect`） |
+| 自检报「**密钥来源: 未找到**」 | ① 确认 `$HERMES_HOME/.env` 里有 `AGNES_API_KEY=`（`grep -c` 只应有 1 条）；② Docker 情形确认这个 `.env` 在容器内的路径正确（用 2.1 的 `docker inspect` 对照）；③ 若想复用 provider 那把 Key，确认 `config.yaml` 里 agnes 那个 provider 认得出（写了 `base_url` 就必须指向 `agnes-ai.cn`） |
 | 「**没有找到 Agnes API Key**」 | 同上。另外确认你是从**宿主机**写 `.env`，而不是 `docker exec` 进容器后写进了 `/root/.env` |
 | 写完 `.env` 但自检仍读不到 | 环境变量一般在**进程启动时**读取 —— 重启容器再试：`docker restart <容器名>`。<br>⚠️ 未验证：Hermes 是否支持热加载 `.env`，没找到官方说明 |
-| Docker 里设了环境变量仍读不到 | 官方补充手段：`config.yaml` 里加 `terminal.env_passthrough: [AGNES_API_KEY]`。**本 skill 已声明，正常不需要** —— 只有删改了 frontmatter 时才用得上 |
+| 设了环境变量仍读不到 | 脚本读的是 `.env` **文件**，环境变量只是备选来源。写进文件即可；确实想用环境变量就声明透传：`config.yaml` 加 `terminal.env_passthrough: [AGNES_API_KEY]` |
 | 产物「找不到」 | 见 2.5 节：默认输出在容器内的 `~/agnes-output`，要设 `out_dir: /opt/data/agnes-output` |
 | `目标地址不是 Agnes 域名，已中止` | 守卫正常工作（退出码 **3** + `[agnes-guard]`）。要走自建代理请设 `AGNES_TRUSTED_HOSTS=<你的域名>`，别一上来就 `AGNES_ALLOW_ANY_HOST=1` |
 | 退出码 `2` 但以为是守卫拦的 | `2` 是请求 / 网络 / API 类失败（**请求已发出**）；被守卫拦下是 `3`。两个码分开正是为了区分这两种 |
 | `No module named ...` | 理论上不会（零依赖）。若出现，说明跑的不是 Python 3，检查 `python3 --version` |
 | `SyntaxError` | 容器里的 Python 低于 3.7。换个 Python 或升级镜像 |
 | `HTTP 404 Not Found`（GET 某个地址时） | ✅ 正常：`/v1` 是 POST 端点，GET 返回 404 不代表服务不可用 |
-| `HTTP 429 您已达到免费用户的 API 速率限制` | 视频创建**不能并发**，重试退避要 ≥30 秒 |
-| `HTTP 503 视频队列已满` | 服务端队列拥塞，退避 45 秒以上重试，与额度无关 |
+| `HTTP 429 您已达到免费用户的 API 速率限制` | 视频创建**不能并发**。脚本已内置创建重试退避（45s / 90s / 180s）；批量出片请串行调用，且调用间隔 ≥ 30 秒 |
+| `HTTP 503 视频队列已满` | 服务端队列拥塞，与额度无关。脚本已内置同一套退避，正常会自动扛过去（实测约 107 秒完成） |
 | SSL 证书错误 | 企业代理 / 自签证书环境，设 `AGNES_INSECURE=1`（仅可信网络） |
 | 中文乱码 / UnicodeEncodeError | 理论上不会：脚本已把 stdout/stderr 强制为 UTF-8 |
 

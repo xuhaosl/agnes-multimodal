@@ -1,7 +1,7 @@
 ---
 name: agnes-multimodal
 description: Agnes 图像与视频生成：文生图、图生图、多图合成、文生视频、首尾帧、图片音频参考。触发词：生成图片、画一张、文生图、图生图、生成视频、文生视频、Agnes 图像、Agnes 视频。
-version: 1.5.0
+version: 1.5.1
 author: xuhaosl
 license: MIT
 platforms: [macos, linux, windows]
@@ -11,9 +11,10 @@ metadata:
     category: media
 required_environment_variables:
   - name: AGNES_API_KEY
+    optional: true
     prompt: "Agnes AI API Key"
-    help: "在 https://www.agnes-ai.cn 控制台获取。WorkBuddy 本机会自动复用已配置的 agnes 模型密钥，可不填"
-    required_for: "调用 Agnes 图像 / 视频接口"
+    help: "一般不用填：Hermes / WorkBuddy 里已经配好 agnes 模型时，脚本会直接复用同一把 Key（读 config.yaml 里的 provider + .env）。只有本机从未配过 agnes 时才需要，在 https://www.agnes-ai.cn 控制台获取"
+    required_for: "可选：仅当本机没有任何 agnes provider 配置时才用到"
 ---
 
 # Agnes 多模态生成（图像 + 视频）
@@ -146,7 +147,7 @@ python "<SKILL_DIR>/scripts/agnes_common.py" --history 20
 | --- | --- |
 | WorkBuddy | `~/.workbuddy/skills/agnes-multimodal` |
 | Hermes（原生） | `~/.hermes/skills/agnes-multimodal`（也可放在分类子目录下） |
-| Hermes（Docker） | 容器内为 `/opt/data/skills/agnes-multimodal` |
+| Hermes（Docker） | 容器内为 `/opt/data/skills/media/agnes-multimodal`（`media` 是可选分类层，见下方路径约定） |
 
 路径含空格时整体加引号（Windows 上尤其常见）。
 
@@ -269,10 +270,12 @@ python "<SKILL_DIR>/scripts/agnes_common.py" --history 20
   fps/pix_fmt/音频参数），否则 `-f concat -c copy` 会直接拼坏画面。
 - **除了 429，还有 `HTTP 503 视频队列已满`（已实测 2026-09-17）**。这是服务端队列拥塞，
   和免费额度无关，**同样靠退避重试解决**。实测 `503 → 503 → 429` 连着来是常态，
-  第 3 次（累计等 45+90s）才创建成功。调用方退避别低于 45s，脚本内建的 2s/4s 两次远远不够。
+  第 3 次（累计等 45+90s）才创建成功。**脚本已把这套退避内置**：创建任务的
+  `CREATE_BACKOFF = 45.0`（即 45s / 90s / 180s），调用方只需保证串行。
 - **创建任务也不能并发（已实测 2026-09-17）**。同一时刻只能有 **1 个** 视频创建请求在飞。
   同时发 6 个 `agnes_video.py`，只有 1 个成功，其余全部 `HTTP 429: 您已达到免费用户的 API 速率限制`。
-  脚本自身的 2 次重试（2s / 4s）不够用，**必须由调用方串行 + 放大重试间隔**。
+  脚本**已内置 45s / 90s / 180s 的创建退避**（`CREATE_BACKOFF = 45.0` / `CREATE_RETRIES = 3`），
+  但并发本身解决不了：**仍必须由调用方串行**。
   串行逐个跑（每个间隔 ≥ 30 秒）实测零限流。批量出片请写驱动脚本按顺序调用，不要用并行工具调用。
 - **轮询会被 429 限流（已实测）**。官方建议 1-2 秒查一次，但实测这个频率会被**大量**限流
   （2.5 秒间隔仍频繁出现 `429 查询过于频繁`）。脚本默认轮询间隔 **5 秒**，

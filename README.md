@@ -71,15 +71,16 @@ agnes-multimodal/
 │   ├── image-api.md        # 图像接口速查
 │   └── video-api.md        # 视频接口速查
 └── tests/
-    ├── run_all.py                  # 一条命令跑齐下面 8 套，并核对项数
-    ├── test_hermes_key.py          # 复用宿主已配好的同一把 Key
-    ├── test_hermes_real_config.py  # 真实部署结构（序列 + key_env）与升级改名
-    ├── test_readonly_hermes.py     # 只读铁律：写入被拦 + 目标文件字节零变化
-    ├── test_key_bootstrap.py       # 密钥自举：检查 / 写入 / 覆盖 / 缺失引导
-    ├── test_domain_guard.py        # 域名判定：域后缀边界 + 三道守卫
-    ├── test_guard_bypass.py        # 守卫的绕过路径（走真实命令行）
-    ├── test_py39_syntax.py         # Python 3.9 兼容性
-    └── test_zero_deps.py           # 零依赖：无第三方 import（含判据自检）
+    ├── run_all.py                       # 一条命令跑齐下面 9 套，并核对项数
+    ├── test_hermes_key.py               # 复用宿主已配好的同一把 Key
+    ├── test_hermes_real_config.py       # 真实部署结构（序列 + key_env）与升级改名
+    ├── test_readonly_hermes.py          # 只读铁律：写入被拦 + 目标文件字节零变化
+    ├── test_docker_home_isolation.py    # Docker 数据目录的归属判定，不被 /opt/data 穿透
+    ├── test_key_bootstrap.py            # 密钥自举：检查 / 写入 / 覆盖 / 缺失引导
+    ├── test_domain_guard.py             # 域名判定：域后缀边界 + 三道守卫
+    ├── test_guard_bypass.py             # 守卫的绕过路径（走真实命令行）
+    ├── test_py39_syntax.py              # Python 3.9 兼容性
+    └── test_zero_deps.py                # 零依赖：无第三方 import（含判据自检）
 ```
 
 前置要求只有 Python 3.9+，**不需要 pip 装任何包**。
@@ -116,9 +117,27 @@ agnes-multimodal/
 验收标准不是「拒绝成功」，而是**目标文件字节零变化** ——
 每次拒绝都做 sha256 前后比对 + 目录快照，确认没有 `.tmp` 残留。
 
+**`/opt/data` 不是无条件认的。** Hermes 的 Docker 部署把数据目录挂在 `/opt/data`，
+但**不能因此就把它当成自己的 home** —— 否则一旦你显式设了 `HERMES_HOME`（测试隔离、
+多 profile、别的部署形态），判定仍会串到 `/opt/data` 上，把不属于本 home 的配置读进来、
+写出去。所以采用的是 `_docker_data_dir()`，两条规矩：
+
+1. 显式给了 `HERMES_HOME` → **只认它**，它不等于 `/opt/data` 时，`/opt/data` 直接不参与；
+2. 没给 `HERMES_HOME` → `/opt/data` 里**必须确实有** Hermes 自己的配置文件
+   （`config.yaml` / `config.yml` / `.env`）才算数，光有目录不算。
+
+这个 bug 最坑的地方是**只在容器里复现**：开发机是 Windows，`os.name == "nt"` 走不到
+该分支，本机全绿 —— 但容器里 13 项失败。所以 `test_docker_home_isolation.py` 专门
+把平台探测遮成 posix 来跑这段逻辑。
+
 **产物位置不设限。** 想放哪就放哪，三级覆盖：`--out-dir` > 环境变量 `AGNES_OUT_DIR` >
 配置文件的 `out_dir`。默认 `~/agnes-output` 只是兜底值。
 Docker 部署时记得指到挂载卷内，否则容器重建产物会丢（见 INSTALL.md）。
+
+**创建任务的退避是内置的。** 视频创建实测会遇到 `503`（队列已满）与 `429` 连着来，
+`45s` 量级才建得起来。旧版只在文档里提醒「调用方自己把退避放大」，代码没做 ——
+现在写进常量（`CREATE_BACKOFF = 45.0` / `CREATE_RETRIES = 3`，即 45s / 90s / 180s），
+**你只需要保证串行**。并发是另一回事：同一时刻只能有 1 个创建请求在飞。
 
 **调用可对账。** 每次成功调用写一行凭证到 `~/.agnes/invocations.log`，
 记录时间、类型、模型、端点、状态、产物、备注 —— **不含 API Key**。
@@ -131,8 +150,12 @@ python <SKILL_DIR>/scripts/agnes_common.py --history 20
 
 ## 已验证
 
-分两组：前七条由**仓库内自动化测试**覆盖（合计 117 项，跑 `tests/run_all.py` 就能复现）；
-后两条是**人工验证**的结论，**不在**那 117 项里。
+分两组：前八条由**仓库内自动化测试**覆盖（合计 132 项，跑 `tests/run_all.py` 就能复现）；
+后两条是**人工验证**的结论，**不在**那 132 项里。
+
+> 这 132 项在**带 `HERMES_HOME` 的真实 Docker 部署**上也跑过一遍。
+> 此前那里会挂 13 项：根因是无条件把 `/opt/data` 当自己的 home，导致测试隔离失效、
+> 读到了真实配置。现已修正 —— 见「设计要点」里的 `_docker_data_dir()`。
 
 **自动化测试覆盖**
 
@@ -148,6 +171,10 @@ python <SKILL_DIR>/scripts/agnes_common.py --history 20
   变量不存在等场景一律不取，宁可让你补一次）
 - **只读边界**：22 项 —— 必须拒绝 8 项、必须放行 4 项（防止误伤别处同名文件）、
   读取范围未越权、日志通道降级、产物目录提醒；每次拒绝都验字节零变化
+- **Docker 数据目录归属**：15 项 —— 显式 `HERMES_HOME` 时 `/opt/data` 不得参与
+  （读侧 `_hermes_homes()` 与写侧 `writable_config_path()` 各一条）；
+  目录里没有 Hermes 配置文件就不认；`HERMES_HOME=/opt/data` 时承诺不变；
+  判据自身的注入先做自检（注入失效时后面结论全都不可信）
 - **密钥自举**：20 项 —— 无 Key 时的结构化引导、写入与读回闭环、覆盖时保留其它字段、
   不回显完整 Key
 - **兼容性**：3 层 —— 3.9 语法解析（全仓库 12 个文件）、联合类型注解必须有
@@ -166,13 +193,13 @@ python <SKILL_DIR>/scripts/agnes_common.py --history 20
   纯文档知识，代码里没有对应常量可供自动比对
 - **端到端**：图像与视频真实调用均正常落盘 —— 需要真实 Key 与额度，不适合放进测试
 
-合计 **117 项断言**（即上面那七条）。不用信我，仓库自带测试，零依赖（只要 Python 3.9+）：
+合计 **132 项断言**（即上面那八条）。不用信我，仓库自带测试，零依赖（只要 Python 3.9+）：
 
 ```bash
 python tests/run_all.py
 ```
 
-其中「本机真实环境 check-key」1 项在未配置密钥的机器上自动跳过（116 项）；
+其中「本机真实环境 check-key」1 项在未配置密钥的机器上自动跳过（131 项）；
 「零依赖」里的真实探针在 site-packages 不可写时跳过（有上一条②兜底）。
 
 ## License

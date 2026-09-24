@@ -21,6 +21,7 @@ SUITES = [
     ("test_hermes_key.py", 13, "Hermes 现场配置复用同一把 Key：形态覆盖 + 误用防护"),
     ("test_hermes_real_config.py", 12, "真实部署结构（序列 + key_env）与升级改名"),
     ("test_readonly_hermes.py", 22, "只读铁律：写入被拦 + 目标文件字节零变化"),
+    ("test_docker_home_isolation.py", 15, "Docker 数据目录的归属判定：HERMES_HOME 隔离不被穿透"),
     ("test_key_bootstrap.py", 20, "密钥自举：检查 / 写入 / 覆盖 / 缺失引导"),
     ("test_domain_guard.py", 29, "域名判定：后缀边界 + 三道守卫 + 白名单"),
     ("test_guard_bypass.py", 12, "守卫绕过路径：--resume / --poll-url / 环境变量 走真实命令行"),

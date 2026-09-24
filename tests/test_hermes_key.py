@@ -17,9 +17,19 @@ COMMON = Path(__file__).resolve().parent.parent / "scripts" / "agnes_common.py"
 results = []
 
 
+# 本机真实凭据一律不进子进程：宿主若导出了某个 key_env 变量，
+# 「不该命中」的用例会被它喂出假结果 —— 被测代码本来就会回退到进程环境取值。
+# 四个已知变量之外，还要连 Hermes 的 provider 变量族（HERMES_CUSTOM_API_*）一起剔。
+SCRUB_KEYS = ("AGNES_API_KEY", "AGNES_AI_API_KEY", "AGNES_CONFIG_PATH", "HERMES_HOME")
+
+
+def _clean_env():
+    return {k: v for k, v in os.environ.items()
+            if k not in SCRUB_KEYS and not k.startswith("HERMES_CUSTOM_API")}
+
+
 def run(env=None):
-    base = {k: v for k, v in os.environ.items()
-            if k not in ("AGNES_API_KEY", "AGNES_AI_API_KEY", "AGNES_CONFIG_PATH", "HERMES_HOME")}
+    base = _clean_env()
     if env:
         base.update(env)
     p = subprocess.run([PY, str(COMMON), "--check-key"], capture_output=True, text=True,

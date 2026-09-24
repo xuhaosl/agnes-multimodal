@@ -20,7 +20,11 @@ skipped = []
 
 
 def run(args, env=None, cwd=None):
-    base = {k: v for k, v in os.environ.items() if k not in ("AGNES_API_KEY", "AGNES_AI_API_KEY", "AGNES_CONFIG_PATH")}
+    # HERMES_HOME 也必须剔掉：否则继承宿主的 home，下面「无密钥场景」就没隔离住，
+    # 子进程会读到真实 Hermes 配置里那把 Key。HERMES_CUSTOM_API_* 同理（key_env 回退）。
+    base = {k: v for k, v in os.environ.items()
+            if k not in ("AGNES_API_KEY", "AGNES_AI_API_KEY", "AGNES_CONFIG_PATH", "HERMES_HOME")
+            and not k.startswith("HERMES_CUSTOM_API")}
     if env:
         base.update(env)
     p = subprocess.run(
@@ -40,7 +44,8 @@ with tempfile.TemporaryDirectory() as td:
     home = Path(td) / "home"
     home.mkdir()
     cfg = Path(td) / "cfg" / "config.json"
-    clean = {"HOME": str(home), "USERPROFILE": str(home)}
+    # HERMES_HOME 指到隔离目录（与另两个套件一致），否则子进程仍可能读到真实 home。
+    clean = {"HERMES_HOME": str(home), "HOME": str(home), "USERPROFILE": str(home)}
 
     # 1) 无密钥场景：应报 [agnes-need-key] 且退出码 1
     code, out = run(["--check-key"], env=clean)

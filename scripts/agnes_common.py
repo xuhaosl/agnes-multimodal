@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """Agnes AI 多模态公共模块。
 
-设计目标：在 Hermes Agent（local / Docker / Modal 后端）以及任意
-macOS / Linux / WSL2 / NAS / Windows 环境上直接跑，不装任何第三方包。
+设计目标：同一份脚本能在 Windows(WorkBuddy) / macOS / Linux / WSL2 / NAS /
+Hermes Agent（local / Docker / Modal 后端）上直接跑，不装任何第三方包。
 
 因此这里只用 Python 标准库（urllib），刻意不用 requests / openai SDK。
 
@@ -12,8 +12,8 @@ macOS / Linux / WSL2 / NAS / Windows 环境上直接跑，不装任何第三方�
   2. 环境变量 AGNES_API_KEY      <- Hermes 的 required_environment_variables 会注入这个
   3. 环境变量 AGNES_AI_API_KEY
   4. 配置文件 ~/.agnes/config.json 或 ~/.config/agnes/config.json 的 api_key
-
-本文件不读取任何宿主应用的私有配置，只认上面这四条。
+  5. WorkBuddy 模型配置 ~/.workbuddy/models.json 中 id 含 "agnes" 的条目 apiKey
+     （所以在本机 WorkBuddy 里是零配置的）
 
 Base URL 解析顺序：--base-url > AGNES_BASE_URL > config.json 的 base_url > 官方中国站默认值
 """
@@ -42,6 +42,12 @@ VIDEO_MODEL_DEFAULT = "agnes-video-2.5-flash"
 # 调用凭证日志：每次真实调用追加一行，供事后审计「到底打给了谁、用了哪个模型」。
 LOG_PATH = "~/.agnes/invocations.log"
 LOG_HEADER = "time\tkind\tmodel\tendpoint\tstatus\tartifact\tnote"
+
+# 密钥写入位置的环境变量覆盖；同时参与「读」的候选顺序，保证写入点一定可读回。
+CONFIG_PATH_ENV = "AGNES_CONFIG_PATH"
+KEY_ENV_NAMES = ("AGNES_API_KEY", "AGNES_AI_API_KEY")
+# Hermes Docker 部署下的挂载卷内配置路径（容器内 ~ 不是持久化卷）
+DOCKER_CONFIG_PATH = "/opt/data/agnes/config.json"
 
 # 让中文输出在 Windows 控制台（cp936）下也不炸
 for _stream in (sys.stdout, sys.stderr):
@@ -81,10 +87,11 @@ def guard_fail(message: str) -> None:
 def emit_result(path_or_url: str, label: str = "") -> None:
     """把最终产物作为「裸绝对路径」打到 stdout。
 
-    这一行是 Hermes 的媒体交付集成点：
-      - gateway 会从回复里抽取媒体路径，默认作为**内联图片气泡**发出（会被有损压缩）；
-      - agent 若在回复末尾带上 `[[as_document]]` 指令，gateway 会改为
-        把路径交付成**可下载的文件附件**（高分辨率图像 / 视频应该走这条）。
+    这一行是跨平台集成点：
+      - WorkBuddy 直接读这一行拿文件；
+      - Hermes 的 gateway 会从回复里抽取媒体路径，**默认渲染成内联图**
+        （会被有损压缩）。高分辨率图 / 视频要在回复末尾加 `[[as_document]]`，
+        gateway 才会改成可下载的文件附件。
     所以：路径必须单独占一行、必须是绝对路径、不要再包引号或 markdown 链接。
     """
     p = Path(path_or_url).expanduser()
@@ -104,11 +111,18 @@ def read_json(path: Path):
 
 
 def _config_candidates():
-    return [
+    """读取候选顺序。写入点必须全部在列表内，否则会出现「写进去了却读不到」。"""
+    out = []
+    env_path = os.environ.get(CONFIG_PATH_ENV, "").strip()
+    if env_path:
+        out.append(Path(env_path).expanduser())
+    out.extend([
         Path.home() / ".agnes" / "config.json",
         Path.home() / ".config" / "agnes" / "config.json",
         Path(__file__).resolve().parent.parent / "config.json",
-    ]
+        Path(DOCKER_CONFIG_PATH),
+    ])
+    return out
 
 
 def load_config() -> dict:
@@ -119,12 +133,283 @@ def load_config() -> dict:
     return {}
 
 
-def resolve_api_key(cli_value: str | None = None) -> str:
-    """解析 Agnes API Key。
+def _key_from_workbuddy_models() -> str:
+    """从 WorkBuddy 的模型配置里捞 agnes 的 apiKey。
 
-    只认四条来源：命令行参数 / AGNES_API_KEY / AGNES_AI_API_KEY / ~/.agnes/config.json。
-    Hermes 场景下首选环境变量 —— frontmatter 声明后会由宿主引导填写并注入沙箱。
+    只在「用户已经在本机接入了 agnes 文本模型」时命中，
+    这样在 WorkBuddy 上是零配置；在 Hermes / NAS 上这条自然落空。
     """
+    for name in ("models.json",):
+        data = read_json(Path.home() / ".workbuddy" / name)
+        if not isinstance(data, list):
+            continue
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            ident = str(entry.get("id", "")) + str(entry.get("name", ""))
+            if "agnes" in ident.lower():
+                key = entry.get("apiKey") or entry.get("api_key")
+                if key:
+                    return str(key).strip()
+    return ""
+
+
+# --------------------------------------------------------------------------
+# 复用 Hermes 已经配好的 Agnes 凭据
+#
+# Hermes 把模型 provider 配置放在 ~/.hermes/config.yaml（Docker 部署下容器里的
+# ~/.hermes 就等于挂载卷 /opt/data）。密钥两种放法：直接写在 provider 的 api_key，
+# 或只写变量名（key_env）由 ~/.hermes/.env 提供。
+#
+# 既然用户已经给 Hermes 配好了 Agnes，多模态就该复用同一把 Key ——
+# 让他为 skill 再配第二遍是没有道理的。
+#
+# 只做缩进感知的行级解析，不引第三方 YAML 库（本 skill 只用标准库），
+# 因此刻意只支持「块式映射 + 标量」这一种写法，遇到 flow style 就放弃该段。
+# --------------------------------------------------------------------------
+
+HERMES_HOME_ENV = "HERMES_HOME"
+ENV_KEY_NAME_HINT = ("AGNES_API_KEY", "AGNES_AI_API_KEY")
+# 归属证据：不写死 section 名（Hermes 升级可能改叫 providers / custom_providers / 别的），
+# 改看内容像不像 Agnes，这样名字变了也还能命中。
+AGNES_HOST_HINT = "agnes-ai.cn"
+AGNES_MODEL_HINT = re.compile(r"agnes-(?:image|video|\d)", re.I)
+
+
+def _hermes_homes() -> list:
+    out = []
+    raw = os.environ.get(HERMES_HOME_ENV, "").strip()
+    if raw:
+        out.append(Path(raw).expanduser())
+    out.append(Path.home() / ".hermes")
+    if os.name != "nt":
+        out.append(Path("/opt/data"))
+    seen, uniq = set(), []
+    for item in out:
+        token = str(item)
+        if token not in seen:
+            seen.add(token)
+            uniq.append(item)
+    return uniq
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _strip_scalar(raw: str) -> str:
+    """去掉 YAML 标量的引号与行尾注释。"""
+    value = raw.strip()
+    if not value:
+        return ""
+    if value[0] in "\"'":
+        quote = value[0]
+        end = value.find(quote, 1)
+        return value[1:end] if end > 0 else value[1:]
+    # 只有「空白 + #」才算注释，避免把 sk-abc#def 这种值截断
+    m = re.match(r"^(.*?)\s+#", value)
+    if m:
+        value = m.group(1)
+    return value.strip().rstrip(",")
+
+
+def _eff_indent(line: str) -> int:
+    """有效缩进：YAML 序列项 `- ` 的内容等价于多缩进 2，这里折算进去。
+
+    没有这层折算，`- name: Agnes`（`-` 与父键同缩进）会被当成同级行，
+    整个序列就切不出来了。
+    """
+    ind = _indent_of(line)
+    return ind + 2 if re.match(r"^[ \t]*-[ \t]+", line) else ind
+
+
+def _yaml_section(text: str, name: str) -> list:
+    """取顶层 `name:` 之下、缩进更深的所有行（含序列项）。flow style 直接放弃。"""
+    out, inside, base = [], False, 0
+    for line in text.splitlines():
+        if inside:
+            if not line.strip():
+                continue
+            if _eff_indent(line) <= base:
+                break
+            out.append(line)
+            continue
+        m = re.match(rf"^(\s*){re.escape(name)}\s*:\s*(.*)$", line)
+        if m and not m.group(1):
+            if m.group(2).strip():
+                return []
+            inside, base = True, len(m.group(1))
+    return out
+
+
+def _top_sections(text: str) -> list:
+    """列出所有顶层块式 section → [(名字, 行列表)]。"""
+    names = []
+    for line in text.splitlines():
+        m = re.match(r"^([A-Za-z0-9_.\-]+)\s*:\s*$", line)
+        if m:
+            names.append(m.group(1))
+    return [(n, _yaml_section(text, n)) for n in names]
+
+
+def _split_entries(lines: list) -> list:
+    """把一段行切成若干条目原文，映射（`k:`）与序列（`- k:`）两种写法都吃。
+
+    关键细节：YAML 序列里 `- name: x` 的 `- ` 占两格，后面的 `  base_url: y`
+    缩进也是两格 —— 二者**有效缩进相同**。所以必须先判定模式：
+    序列模式只认 `- ` 开头的行开新条目，否则每个字段都会被切成独立条目，
+    「有没有 base_url」「有没有 key_env」就散落在不同块里，判定必然错位。
+    """
+    body = [ln for ln in lines if ln.strip()]
+    if not body:
+        return []
+    base = min(_eff_indent(ln) for ln in body)
+    is_seq = any(_eff_indent(ln) == base and re.match(r"^[ \t]*-[ \t]+", ln) for ln in body)
+
+    blocks, buf = [], None
+    for line in body:
+        is_item = bool(re.match(r"^[ \t]*-[ \t]+", line))
+        start = False
+        if _eff_indent(line) == base:
+            if is_seq:
+                start = is_item
+            else:
+                start = bool(re.match(r"^[ \t]*[A-Za-z0-9_.\-]+\s*:", line))
+        if not start:
+            if buf is not None:
+                buf.append(line)
+            continue
+        if buf is not None:
+            blocks.append("\n".join(buf))
+        if is_item:
+            head = re.sub(r"^[ \t]*-[ \t]+", "", line)
+            buf = [" " * (_indent_of(line) + 2) + head]
+        else:
+            buf = [line]
+    if buf is not None:
+        blocks.append("\n".join(buf))
+    return blocks
+
+
+def _agnes_evidence(block: str, section: str) -> list:
+    """返回该配置块属于 Agnes 的证据；空列表 = 认不出 → 不取它的 Key。
+
+    判据分两档，因为 base_url 是决定性的：
+
+    - **写了 base_url**：必须指向 `agnes-ai.cn`，明确指向别家的一律不取。
+      （用户把 Key 配串行的场景很常见，这时候取出来就是拿别家的凭据去打 Agnes。）
+    - **没写 base_url**：才允许靠模型列表 / 命名 / 密钥变量名自证。
+
+    注意 provider 的 `name` 是用户自己起的，只算弱证据，从不单独成立。
+    """
+    label = _yaml_scalar(block, "name")
+    host = (_yaml_scalar(block, "base_url") or _yaml_scalar(block, "api")
+            or _yaml_scalar(block, "url"))
+    var = _yaml_scalar(block, "key_env") or _yaml_scalar(block, "api_key_env")
+
+    if host:
+        if AGNES_HOST_HINT not in host.lower():
+            return []
+        hits = ["base_url 指向 agnes-ai.cn"]
+        if AGNES_MODEL_HINT.search(block):
+            hits.append("模型列表含 agnes-* 条目")
+        return hits
+
+    hits = []
+    if AGNES_MODEL_HINT.search(block):
+        hits.append("模型列表含 agnes-* 条目")
+    if "agnes" in (var + label + section).lower():
+        hits.append("provider 名或密钥变量名含 agnes")
+    return hits
+
+
+def _yaml_scalar(block: str, field: str) -> str:
+    m = re.search(rf"^[ \t]*{re.escape(field)}[ \t]*:[ \t]*(.+)$", block, re.M)
+    return _strip_scalar(m.group(1)) if m else ""
+
+
+def _read_env_file(path: Path) -> dict:
+    data = {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return data
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        if key:
+            data[key] = _strip_scalar(value)
+    return data
+
+
+def _hermes_key_lookup() -> tuple:
+    """返回 (key, 出处说明)；找不到返回 ("", "")。
+
+    判定「这个条目是不是 Agnes」靠内容自证：base_url / 模型列表 / 密钥变量名。
+    刻意**不**依赖 section 名，也**不**把 provider 的 name 当必要条件 ——
+    实测 Hermes 用的键是 `custom_providers`（序列），且 name 是用户自己起的，
+    升级后键名与命名都可能变；只认结构变化不改「内容特征」这件事。
+
+    只读本地文件、只用于调 Agnes，不会外传；宁可不命中，也不猜着用 ——
+    拿别家的 Key 去调 Agnes 会 401，还平白把无关密钥送出网。
+    """
+    for home in _hermes_homes():
+        env_file = _read_env_file(home / ".env")
+        cfg = home / "config.yaml"
+        text = ""
+        if cfg.is_file():
+            try:
+                text = cfg.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                text = ""
+
+        def pick(block: str) -> str:
+            direct = _yaml_scalar(block, "api_key")
+            if direct:
+                return direct
+            var = _yaml_scalar(block, "key_env") or _yaml_scalar(block, "api_key_env")
+            if var:
+                return env_file.get(var, "") or os.environ.get(var, "").strip()
+            return ""
+
+        if text:
+            # 形态甲：顶层任意 section（providers / custom_providers / 升级后改的名）
+            # 下的 provider 条目，映射与序列两种写法都吃。
+            for section, lines in _top_sections(text):
+                for block in _split_entries(lines):
+                    hits = _agnes_evidence(block, section)
+                    if not hits:
+                        continue
+                    key = pick(block)
+                    if key:
+                        label = _yaml_scalar(block, "name")
+                        where = f"{section}" + (f"「{label}」" if label else "")
+                        return key, (f"Hermes 配置 {_short_path(cfg)} 的 {where}"
+                                     f"（依据：{'、'.join(hits)}）")
+
+            # 形态乙：顶层 model: 就是唯一 provider
+            model_block = "\n".join(_yaml_section(text, "model"))
+            if model_block:
+                base = _yaml_scalar(model_block, "base_url") or _yaml_scalar(model_block, "api")
+                default_model = _yaml_scalar(model_block, "default")
+                if "agnes" in (base + default_model).lower():
+                    key = pick(model_block)
+                    if key:
+                        return key, f"Hermes 配置 {_short_path(cfg)} 的 model（base_url={base or '未写'}）"
+
+        # 形态丁：变量名自证 —— 这本来就是给 Agnes 用的，无需再证明归属
+        for var in ENV_KEY_NAME_HINT:
+            if env_file.get(var):
+                return env_file[var], f"Hermes 环境文件 {_short_path(home / '.env')} 的 {var}"
+    return "", ""
+
+
+def resolve_api_key(cli_value: str | None = None) -> str:
     if cli_value and cli_value.strip():
         return cli_value.strip()
     for env_name in ("AGNES_API_KEY", "AGNES_AI_API_KEY"):
@@ -136,15 +421,176 @@ def resolve_api_key(cli_value: str | None = None) -> str:
         value = str(cfg.get(field, "")).strip()
         if value:
             return value
+    value = _hermes_key_lookup()[0]
+    if value:
+        return value
+    value = _key_from_workbuddy_models()
+    if value:
+        return value
     fail(
-        "没有找到 Agnes API Key。按下面任一种方式提供：\n"
-        "  1) 命令行加 --api-key sk-xxxx\n"
-        "  2) 设置环境变量 AGNES_API_KEY=sk-xxxx\n"
-        "     （Hermes：写进 ~/.hermes/.env，或首次加载本 skill 时按提示填写）\n"
-        "  3) 写配置文件 ~/.agnes/config.json -> {\"api_key\": \"sk-xxxx\"}\n"
-        "  Key 从 https://www.agnes-ai.cn 控制台获取。"
+        "[agnes-need-key] 未检测到 Agnes API Key。\n"
+        "交给 agent 处理，不要让用户手动去编辑文件：\n"
+        "  1) 问用户要 Key（在 https://www.agnes-ai.cn 控制台获取，形如 sk-xxxx）\n"
+        f"  2) 用户给出后执行： python {Path(__file__).name} --set-key <用户的KEY>\n"
+        "  3) 然后重跑原任务（脚本会自动读取刚写入的配置）\n"
+        "  Key 只写进本地配置文件，不会被上传到任何地方。"
     )
     raise AssertionError("unreachable")
+
+
+# --------------------------------------------------------------------------
+# 密钥自动配置（由 agent 调用，用户不需要手动碰文件）
+# --------------------------------------------------------------------------
+
+def env_key_hits() -> list:
+    """返回当前已设置密钥的环境变量名，供「写了配置也不生效」的场景告警。"""
+    return [name for name in KEY_ENV_NAMES if os.environ.get(name, "").strip()]
+
+
+# --------------------------------------------------------------------------
+# 只读铁律：Hermes 自己的配置文件，本 skill **只能读**。
+# 任何写入 / 修改 / 删除都要在「动手之前」拦下 —— 连临时文件都不许在那边出现
+# （原子写入会在同目录建 .tmp，所以只靠「别覆盖」是不够的）。
+# --------------------------------------------------------------------------
+
+READONLY_EXIT_CODE = 4          # 与守卫（3）、一般失败（2）分开，便于自测区分
+
+HERMES_RESERVED_NAMES = {
+    "config.yaml", "config.yml", "config.toml",
+    "settings.yaml", "settings.yml",
+    ".env", ".env.local", ".env.production", ".env.development",
+}
+
+
+def is_hermes_protected_file(path: Path) -> bool:
+    """这个路径是 Hermes 自己的文件吗？是的话本 skill 只能读。
+
+    判定 = 文件名是 Hermes 的保留名 **且** 落在某个 Hermes home 之内。
+    （别处同名文件不拦 —— 那只是名字撞了，不是 Hermes 的。）
+    """
+    if path.name.lower() not in HERMES_RESERVED_NAMES:
+        return False
+    try:
+        target = path.expanduser().resolve(strict=False)
+    except Exception:
+        return False
+    for home in _hermes_homes():
+        try:
+            root = home.expanduser().resolve(strict=False)
+        except Exception:
+            continue
+        if target == root or root in target.parents:
+            return True
+    return False
+
+
+def assert_write_allowed(path: Path) -> Path:
+    """写入前的闸门：目标若是 Hermes 的文件，直接拒绝并给出替代方案。
+
+    Hermes 的配置写坏了会导致它起不来，而且这类损坏往往在重启后才暴露。
+    所以宁可不写 —— 换一个路径一样能配好 Key。
+    """
+    if is_hermes_protected_file(path):
+        fail(
+            f"拒绝写入 {_short_path(path.expanduser())}\n"
+            "  这是 Hermes 自己的配置文件，本 skill 对它只有只读权限，不能写入。\n"
+            "  要改 Hermes 的模型 / 密钥配置，请用 `hermes setup` 或手动编辑 ——\n"
+            "  写坏了 Hermes 会起不来，而且往往重启后才暴露。\n"
+            "  如果只是想给本 skill 单独配一把 Key，换个路径就行，例如：\n"
+            "    python agnes_common.py --set-key sk-xxxx --config-path ~/.agnes/config.json",
+            READONLY_EXIT_CODE,
+        )
+    return path
+
+
+def writable_config_path(explicit: str | None = None) -> Path:
+    """决定密钥写进哪个配置文件。
+
+    顺序：
+      1. 显式传入的 --config-path
+      2. 环境变量 AGNES_CONFIG_PATH
+      3. 已存在的候选配置文件 —— 写回原处，避免同一台机器出现两份配置互相打架
+      4. 默认位置：Hermes Docker 容器里写挂载卷 /opt/data/agnes/config.json
+         （容器内 ~ 不是持久化卷，写到那儿一重建就丢）；其余情况写 ~/.agnes/config.json
+
+    注意：返回的路径必须也在 _config_candidates() 里，否则会「写进去了却读不回来」。
+    另外，无论走哪条分支，目标都不能是 Hermes 自己的文件（见 assert_write_allowed）。
+    """
+    raw = (explicit or "").strip() or os.environ.get(CONFIG_PATH_ENV, "").strip()
+    if raw:
+        return assert_write_allowed(Path(raw).expanduser())
+    for path in _config_candidates():
+        if path.exists():
+            return assert_write_allowed(path)
+    if os.name != "nt" and os.path.isdir("/opt/data") and os.access("/opt/data", os.W_OK):
+        return assert_write_allowed(Path(DOCKER_CONFIG_PATH))
+    return assert_write_allowed(Path.home() / ".agnes" / "config.json")
+
+
+def save_api_key(key: str, config_path: str | None = None) -> Path:
+    """把 Key 写进配置文件，保留文件里已有的其它字段（out_dir、image 等）。
+
+    先写临时文件再原子替换，避免中途失败留下半截 JSON 把已有配置毁掉。
+    """
+    key = (key or "").strip()
+    if not key:
+        fail("要写入的 Key 是空的，没有写入任何内容。")
+    path = assert_write_allowed(writable_config_path(config_path))
+    data = read_json(path)
+    if not isinstance(data, dict):
+        data = {}
+    data["api_key"] = key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / (path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)  # Windows 上无实际作用，Linux/NAS 上收紧权限
+    except Exception:
+        pass
+    return path
+
+
+def cli_set_key(argv: list) -> int:
+    """写入密钥：python agnes_common.py --set-key <KEY> [--config-path P]"""
+    key = ""
+    config_path = None
+    rest = list(argv[1:])
+    for idx, token in enumerate(rest):
+        if token == "--set-key" and idx + 1 < len(rest):
+            key = rest[idx + 1]
+        elif token == "--config-path" and idx + 1 < len(rest):
+            config_path = rest[idx + 1]
+        elif not token.startswith("-") and not key:
+            key = token
+    if not key:
+        fail("--set-key 后面要跟 Key，例如：--set-key sk-xxxx")
+    path = save_api_key(key, config_path)
+    print(f"[agnes-key] 已写入 -> {_short_path(path)}")
+    print(f"[agnes-key] 密钥指纹（脱敏）：{_mask(key)}")
+    hits = env_key_hits()
+    if hits:
+        print(f"[agnes-key] ⚠ 环境变量 {' / '.join(hits)} 已存在，且它的优先级高于配置文件，")
+        print("            新写入的 Key 不会生效。要真正换 Key，请改该环境变量后重启会话。")
+    print("[agnes-key] 下一步：重跑原本的图像 / 视频任务即可。")
+    return 0
+
+
+def cli_check_key() -> int:
+    """只检查有没有密钥，不改动任何东西：python agnes_common.py --check-key
+
+    退出码 0 = 已有密钥，1 = 没有（agent 据此决定是否向用户索要）。
+    """
+    source = _identify_key_source()
+    if source:
+        print(f"[agnes-key] OK · 来源={source} · 指纹={_mask(resolve_api_key())}")
+        return 0
+    print("[agnes-need-key] 未检测到 Agnes API Key。")
+    print("请向用户索要 Key，然后执行：")
+    print(f"  python {Path(__file__).name} --set-key <用户的KEY>")
+    return 1
 
 
 def resolve_base_url(cli_value: str | None = None) -> str:
@@ -177,6 +623,35 @@ def derive_poll_url(base_url: str) -> str:
     )
 
 
+_out_dir_warned = False
+
+
+def warn_if_out_dir_in_hermes(path: Path) -> None:
+    """产物目录正好是 Hermes 的家目录时提醒一句。
+
+    这里**不拦** —— 产物图片不会覆盖 Hermes 的任何文件，谈不上破坏；
+    但混在一起容易让人以为 Hermes 目录被人动过，提醒一句更省事。
+    （推荐写法是放在它的子目录里，例如 `/opt/data/agnes-output`，那边不触发。）
+    """
+    global _out_dir_warned
+    if _out_dir_warned:
+        return
+    try:
+        target = path.expanduser().resolve()
+    except Exception:
+        return
+    for home in _hermes_homes():
+        try:
+            if target == home.expanduser().resolve():
+                _out_dir_warned = True
+                eprint(f"[agnes-warn] 产物目录就是 Hermes 的家目录：{_short_path(target)}")
+                eprint("             产物不会覆盖 Hermes 的文件，但建议换到子目录，例如 "
+                       f"{_short_path(target)}/agnes-output")
+                return
+        except Exception:
+            continue
+
+
 def resolve_out_dir(cli_value: str | None = None) -> Path:
     """解析产物目录。顺序与密钥一致：命令行 > 环境变量 > 配置文件 > 默认值。"""
     raw = (cli_value or "").strip()
@@ -187,6 +662,7 @@ def resolve_out_dir(cli_value: str | None = None) -> Path:
     if not raw:
         raw = DEFAULT_OUT_DIR
     path = Path(raw).expanduser()
+    warn_if_out_dir_in_hermes(path)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -391,7 +867,7 @@ def build_filename(stem: str, prompt: str, ext: str) -> str:
 # --------------------------------------------------------------------------
 # 调用审计与来源守卫
 #
-# 宿主环境里可能还有别的生图/生视频能力（那些会消耗配额）。
+# 本机 WorkBuddy 除 Agnes 外还有别的生图/生视频能力（那些会消耗积分）。
 # 为了让「这次到底调的是不是 Agnes」可被事后核对，而不是一句口头保证，
 # 这里做三件事：
 #   1. guard_target()           —— 请求发出前，挡住非 Agnes 的 host / 模型名
@@ -399,9 +875,24 @@ def build_filename(stem: str, prompt: str, ext: str) -> str:
 #   3. log_invocation()         —— 每次调用追加一行凭证日志，可随时审计
 # --------------------------------------------------------------------------
 
-def log_path() -> Path:
+_log_path_warned = False
+
+
+def log_path():
+    """凭证日志的落地路径；若被指到 Hermes 的配置文件上，返回 None（放弃写日志）。
+
+    日志是**追加**写，落在 Hermes 的 config.yaml / .env 上会直接把 YAML 毁掉 ——
+    比覆盖还隐蔽（文件还是「有内容的」，只是结构烂了）。宁可这次不记日志。
+    """
+    global _log_path_warned
     raw = os.environ.get("AGNES_LOG_FILE", "").strip() or LOG_PATH
-    return Path(raw).expanduser()
+    path = Path(raw).expanduser()
+    if is_hermes_protected_file(path):
+        if not _log_path_warned:
+            _log_path_warned = True
+            eprint(f"[agnes-warn] 日志路径指向 Hermes 的配置文件，已跳过写日志：{_short_path(path)}")
+        return None
+    return path
 
 
 def log_invocation(
@@ -415,6 +906,8 @@ def log_invocation(
     """追加一行调用凭证。日志写失败绝不影响主流程。"""
     try:
         path = log_path()
+        if path is None:
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         is_new = not path.exists()
         cells = [
@@ -563,7 +1056,9 @@ def print_receipt(
         f"· 密钥来源={source}"
         + (f" · {note}" if note else "")
     )
-    eprint(f"[agnes] 凭证已追加到 {log_path()}（可随时审计）")
+    _log_target = log_path()
+    if _log_target is not None:
+        eprint(f"[agnes] 凭证已追加到 {_log_target}（可随时审计）")
 
 
 # --------------------------------------------------------------------------
@@ -603,6 +1098,11 @@ def _identify_key_source() -> str:
                 data = read_json(path)
                 if isinstance(data, dict) and str(data.get(field, "")).strip():
                     return f"配置文件 {_short_path(path)}"
+    hint = _hermes_key_lookup()[1]
+    if hint:
+        return hint
+    if _key_from_workbuddy_models():
+        return "WorkBuddy 模型配置 " + _short_path(Path.home() / ".workbuddy" / "models.json")
     return ""
 
 
@@ -639,7 +1139,9 @@ def selfcheck() -> int:
     except Exception as exc:
         print(f"输出目录 : 创建失败 {exc}")
     print(f"Python   : {sys.version.split()[0]} ({sys.executable})")
-    print(f"凭证日志 : {log_path()}")
+    _log_show = log_path()
+    print("凭证日志 : " + (str(_log_show) if _log_show
+                          else "已跳过 —— 路径指向 Hermes 的配置文件（本 skill 对 Hermes 只读）"))
     rows = read_all_rows()
     if rows:
         kinds: dict = {}
@@ -653,7 +1155,8 @@ def selfcheck() -> int:
         print("累计调用 : 还没有记录，跑一次图像或视频脚本后这里会有凭证")
     print("-" * 46)
     if not source:
-        print("未找到可用密钥，按 SKILL.md「密钥与配置」补上再试。")
+        print("未找到可用密钥。请让 agent 用 --set-key 写入，或手动执行：")
+        print(f"  python {Path(__file__).name} --set-key <KEY>")
         return 1
     print("密钥可用。可以跑 agnes_image.py / agnes_video.py 了。")
     return 0
@@ -661,7 +1164,7 @@ def selfcheck() -> int:
 
 def read_all_rows() -> list:
     path = log_path()
-    if not path.exists():
+    if path is None or not path.exists():
         return []
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -671,9 +1174,14 @@ def read_all_rows() -> list:
 
 
 def show_history(limit: int) -> int:
+    path = log_path()
+    if path is None:
+        print("日志路径指向 Hermes 的配置文件，已放弃读写 —— 本 skill 对 Hermes 只读。")
+        print("换个位置再试：AGNES_LOG_FILE=~/.agnes/invocations.log")
+        return 1
     rows = read_all_rows()
     if not rows:
-        print(f"还没有调用记录（{log_path()} 为空或不存在）。")
+        print(f"还没有调用记录（{path} 为空或不存在）。")
         return 0
     print(f"最近 {min(limit, len(rows))} / {len(rows)} 条 Agnes 调用凭证")
     print("-" * 78)
@@ -689,17 +1197,22 @@ def show_history(limit: int) -> int:
         if note:
             print(f"    备注 : {note}")
     print("-" * 78)
-    print(f"日志文件：{log_path()}")
+    print(f"日志文件：{path}")
     return 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("--history", "-H"):
+    _argv = sys.argv
+    if len(_argv) > 1 and _argv[1] in ("--history", "-H"):
         _limit = 10
-        if len(sys.argv) > 2:
+        if len(_argv) > 2:
             try:
-                _limit = max(1, int(sys.argv[2]))
+                _limit = max(1, int(_argv[2]))
             except ValueError:
                 pass
         raise SystemExit(show_history(_limit))
+    if "--set-key" in _argv:
+        raise SystemExit(cli_set_key(_argv))
+    if "--check-key" in _argv or "--check" in _argv:
+        raise SystemExit(cli_check_key())
     raise SystemExit(selfcheck())
